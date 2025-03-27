@@ -24,6 +24,11 @@ The script (`container-image-migrator.sh`) is intended to provide an "easy" and 
 - `-c <config file>`
     - **required**
     - Path to JSON configuration file for the given migration run
+- `-t`
+    - **optional**
+    - Enables a "testing" mode that will skip invoking `skopeo copy` command
+        - Additionally, no `status` updates will be written to the `*.state` file
+    - :warning: Other `skopeo` (read) commands will still execute and could count against any rate limiting for your account
 - `-x`
     - **optional**
     - Enable shell tracing output - which can be beneficial to diagnose issues with the script
