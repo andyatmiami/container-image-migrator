@@ -1,6 +1,6 @@
 #! /usr/bin/env bash
 
-set -euo pipefail
+set -uo pipefail
 
 _usage()
 {
@@ -10,8 +10,13 @@ _usage()
 function trap_exit() {
 	rc=$?
 
+    # ensure any logging output flushed
+    sync
+
     # unwind any pushd commands
     while popd >/dev/null 2>&1; do :; done
+
+    rm -f "${auth_file}"
 
 	set +x
 
@@ -20,40 +25,48 @@ function trap_exit() {
 
 trap "trap_exit" EXIT
 
+_fail()
+{
+    local msg="${1:-}"
+
+    printf '\n%s\n\n' "${msg}" >&2
+    exit 1
+}
+
+_set_script_dir()
+{
+    if [ -n "${BASH_VERSION}" ]; then
+        script_dir=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )
+    elif [ -n "${ZSH_VERSION}" ]; then
+        # Zsh specific: Use $0 for the script path
+        script_dir=$( cd -- "$( dirname -- "${0}" )" &> /dev/null && pwd )
+    else
+        # For other shells, assume $0 is the path
+        printf '%s\n' "**WARNNING** Detected shell '${SHELL}' is not supported.  Consider using 'bash' or 'zsh'..." >&2
+        script_dir=$( cd -- "$( dirname -- "${0}" )" &> /dev/null && pwd )
+    fi
+}
+
+_do_invoke()
+{
+    if { [ -n "${ZSH_VERSION:-}" ] && [ "${0}" != "${ZSH_EVAL_CONTEXT:-}" ]; } || { [ -n "${BASH_VERSION:-}" ] && [ "${BASH_SOURCE:-}" != "${0}" ]; }; then
+        return 1
+    fi
+
+}
+
 _check_dependency()
 {
     local name="${1:-}"
     local url="${1:-}"
 
-    if [ -z "$(which "${name}")" ]; then
-        printf '%s\n%s\n' "'${name}' utility not found" "Please install appropriate distribution package from ${url} and re-run script."
-        exit 1
-    fi
-}
+    local binary=
+    set +e
+    binary=$(which "${name}")
+    set -e
 
-_discover_container_engine()
-{
-    local possible_engine=
-    possible_engine="$(which podman)"
-    container_engine_auth_file="${HOME}/.config/containers/auth.json"
-    if [ -z "${possible_engine}" ]; then
-        possible_engine="$(which docker)"
-        container_engine_auth_file="${HOME}/.docker/config.json"
-    fi
-
-    container_engine="${possible_engine}"
-
-    if [ -z "${container_engine}" ]; then
-        printf '%s\n%s\n' "Neither 'docker' nor 'podman' utility found" "Please install container engine of choice and re-run script."
-        exit 1
-    else
-        printf '%s\n' "Using $(basename "${container_engine}") for container image migration."
-    fi
-
-    local auth_file_override=
-    auth_file_override=$(jq '.container_engine_auth_file // empty' "${config_file}")
-    if [ -n "${auth_file_override}" ]; then
-        container_engine_auth_file="${auth_file_override}"
+    if [ -z "${binary}" ]; then
+        _fail "'${name}' utility not found... Please install appropriate distribution package from ${url} and re-run script."
     fi
 }
 
@@ -61,8 +74,6 @@ _verify_prereqs()
 {
     _check_dependency "skopeo" "https://github.com/containers/skopeo/blob/main/install.md"
     _check_dependency "jq" "https://jqlang.org/download/"
-
-    _discover_container_engine
 }
 
 _parse_opts()
@@ -74,10 +85,10 @@ _parse_opts()
 			c )
 				config_file=$(readlink -f "${OPTARG}")
                 if [ -z "${config_file}" ]; then
-                    printf '%s: file not found\n' "${OPTARG}"
-                    exit 1
+                    _fail "file not found: '${OPTARG}'"
                 fi
                 state_file="${config_file}.state"
+                auth_file="${config_file}.auth"
 				;;
 			t)
 				dry_run='t'
@@ -98,22 +109,57 @@ _parse_opts()
 
 
     if ! [ -e "${config_file}" ]; then
-        printf '%s: file not found\n' "${config_file}"
-        exit 1
+        _fail "file not found: '${config_file}'"
     fi
 
     if ! jq 'empty' "${config_file}" &> /dev/null; then
-        printf '%s: file cannot be parsed as JSON\n' "${config_file}"
-        exit 1
+        _fail "file cannot be parsed as JSON: '${config_file}'"
     fi
 
     source_container_registry_host=$(jq -r '.container_registries.source.host // empty' "${config_file}")
     target_container_registry_host=$(jq -r '.container_registries.target.host // empty' "${config_file}")
 }
 
+_initialize_state()
+{
+    printf "{}" > "${auth_file}"
+
+    if ! [ -e "${state_file}" ]; then
+        printf '%s' '{"repos": {}}' > "${state_file}"
+    fi
+}
+
+_login()
+{
+    local host="${1:-}"
+    local username="${2:-}"
+    local password_from_env="${3:-}"
+
+    if [ -n "${username}" ]; then
+
+        local rc=
+        set +e
+        local authenticated_user=
+        authenticated_user=$(skopeo login --compat-auth-file "${auth_file}" "${host}" --get-login 2> /dev/null)
+        rc="$?"
+        set -e
+
+        if [ "${rc}" -ne 0 ] || [ "${authenticated_user}" != "username" ]; then
+            local password="${password_from_env}"
+
+            if [ -z "${password_from_env}" ]; then
+                printf '%s\n' "Enter your password for ${username} on ${host}:"
+                read -rs password
+            fi
+
+            skopeo login --compat-auth-file "${auth_file}" -u "${username}" -p "${password}" "${host}"
+        fi
+    fi
+}
+
 _confirm_auth()
 {
-    printf '%s\n' "Checking ${container_engine_auth_file} to confirm appropriate authentication..."
+    printf '%s\n' "Checkingto confirm appropriate authentication..."
 
     local source_container_registry_username=
     source_container_registry_username=$(jq -r '.container_registries.source.username // empty' "${config_file}")
@@ -121,35 +167,8 @@ _confirm_auth()
     local target_container_registry_username=
     target_container_registry_username=$(jq -r '.container_registries.target.username // empty' "${config_file}")
 
-
-    local source_container_registry_auth=
-    source_container_registry_auth=$(jq -r --arg source_host "${source_container_registry_host}" '.auths[$source_host].auth // empty | @base64d' "${container_engine_auth_file}")
-    if { [ -n "${source_container_registry_username}" ] && [ -z "${source_container_registry_auth}" ]; } \
-        || { [ -n "${source_container_registry_username}" ] && [ "${source_container_registry_auth#"${source_container_registry_username}"}" = "$source_container_registry_auth" ]; } ; then
-
-        printf '%s\n' "Enter your password for ${source_container_registry_username} on ${source_container_registry_host}:"
-        read -rs password
-
-        ${container_engine} login "${source_container_registry_host}" -u "${source_container_registry_username}" -p "${password}"
-    fi
-
-    local target_container_registry_auth=
-    target_container_registry_auth=$(jq -r --arg target_host "${target_container_registry_host}" '.auths[$target_host].auth // empty | @base64d' "${container_engine_auth_file}")
-    if { [ -n "${target_container_registry_username}" ] && [ -z "${target_container_registry_auth}" ]; } \
-        || { [ -n "${target_container_registry_username}" ] && [ "${target_container_registry_auth#"${target_container_registry_username}"}" = "${target_container_registry_auth}" ]; } ; then
-
-        printf '%s\n' "Enter your password for ${target_container_registry_username} on ${target_container_registry_host}:"
-        read -rs password
-
-        ${container_engine} login "${target_container_registry_host}" -u "${target_container_registry_username}" -p "${password}"
-    fi
-}
-
-_initialize_state()
-{
-    if ! [ -e "${state_file}" ]; then
-        printf '%s' '{"repos": {}}' > "${state_file}"
-    fi
+    _login "${source_container_registry_host}" "${source_container_registry_username}" "${SOURCE_CONTAINER_REGISTRY_PASSWORD:-}"
+    _login "${target_container_registry_host}" "${target_container_registry_username}" "${TARGET_CONTAINER_REGISTRY_PASSWORD:-}"
 }
 
 _get_image_url()
@@ -171,7 +190,7 @@ _cache_image_manifest()
 
     # 'skopeo inspect' is a rate-limited operation!
     local manifest_json=
-    manifest_json=$(skopeo inspect --retry-times "${skopeo_retries}" --raw "${url}")
+    manifest_json=$(skopeo inspect --authfile "${auth_file}" --retry-times "${skopeo_retries}" --raw "${url}")
 
     local manifest_media_type=
     manifest_media_type=$(jq -r '.mediaType' <<< "${manifest_json}")
@@ -224,7 +243,7 @@ _discover_image_tags()
         local url="docker://${source_container_registry_host}/${image}"
         printf '%s\n' "Querying ${url} for tags matching filters '${filter_array}'..."
         local image_tags=
-        image_tags=$(skopeo list-tags --retry-times "${skopeo_retries}" "${url}" | jq -r --argjson filters "${filter_array}" '.Tags | map(. as $tag | select(any($filters[]; . as $filter | $tag | test($filter)))) | join (" ")')
+        image_tags=$(skopeo list-tags --authfile "${auth_file}" --retry-times "${skopeo_retries}" "${url}" | jq -r --argjson filters "${filter_array}" '.Tags | map(. as $tag | select(any($filters[]; . as $filter | $tag | test($filter)))) | join (" ")')
 
         for tag in ${image_tags}; do
 
@@ -298,7 +317,7 @@ _copy_images()
         set +e
         # Should this be smarter to handle cases where the image might already exist but has a different set of supported platforms?!
         # shellcheck disable=SC2034
-        inspect_results=$(skopeo inspect --retry-times "${skopeo_retries}" --raw "$target_image_url" 2>&1)
+        inspect_results=$(skopeo inspect --authfile "${auth_file}" --retry-times "${skopeo_retries}" --raw "$target_image_url" 2>&1)
         rc="$?"
         set -e
 
@@ -312,7 +331,7 @@ _copy_images()
                 set +e
                 local rc=
                 # TODO: detect and "handle" rate limiting errors somehow (really long sleep?  just immediately exit?)
-                skopeo copy --retry-times "${skopeo_retries}" --preserve-digests ${multi_arch:+--multi-arch "$multi_arch"} "${source_image_url}" "${target_image_url}" | sed 's/^/\t/'
+                skopeo copy --authfile "${auth_file}"  --retry-times "${skopeo_retries}" --preserve-digests ${multi_arch:+--multi-arch "$multi_arch"} "${source_image_url}" "${target_image_url}" | sed 's/^/\t/'
                 rc="$?"
                 set -e
 
@@ -339,27 +358,28 @@ main()
 
     _parse_opts "$@"
 
-    _confirm_auth
-
     _initialize_state
+
+    _confirm_auth
 
     _discover_image_tags
 
     _copy_images
 }
 
-script_dir=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )
+script_dir=
+_set_script_dir
+
 config_file="${script_dir}/config.json"
 state_file="${config_file}.state"
+auth_file="${config_file}.auth"
 
 skopeo_retries=3
 
-container_engine=
-container_engine_auth_file=
 dry_run=
 source_container_registry_host=
 target_container_registry_host=
 
-if [[ "${BASH_SOURCE[0]}" = "${0}" ]]; then
+if _do_invoke; then
     main "$@"
 fi

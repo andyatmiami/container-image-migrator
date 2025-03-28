@@ -12,13 +12,19 @@ The script (`container-image-migrator.sh`) is intended to provide an "easy" and 
 
 - `bash`
 - `skopeo`
-- `podman` / `docker`
 - `jq`
 
 
 ## Usage
 
-`./container-image-migrator.sh -c <config file> [-x] [-h]`
+:warning: Script has only been tested against `bash` and `zsh` shells.  While it _may work_ in other shells - there are no promises/guarantees!
+- ℹ️ Shell choice matters when determining:
+   - the absolute path to the location of the script itself
+       - used to create additional files for state management
+    - whether or not the script was sourced
+        - `main` function is **not invoked** if the script is sourced
+
+`./container-image-migrator.sh -c <config file> [-t] [-x] [-h]`
 
 **Arguments**
 - `-c <config file>`
@@ -33,9 +39,20 @@ The script (`container-image-migrator.sh`) is intended to provide an "easy" and 
     - **optional**
     - Enable shell tracing output - which can be beneficial to diagnose issues with the script
        - :warning: Can result in a lot of output being logged
+       - :warning: Can leak credentials in output
 - `-h`
     - **optional**
     - Prints a simple one-line usage statement and exits
+
+**Environment Variables**
+- `SOURCE_CONTAINER_REGISTRY_PASSWORD`
+    - **optional**
+    - Enables a _non-interactive login_ to the source container registry via the `skopeo login` command
+    - If not provided - the script will prompt user for password
+- `TARGET_CONTAINER_REGISTRY_PASSWORD`
+    - **optional**
+    - Enables a _non-interactive login_ to the target container registry via the `skopeo login` command
+    - If not provided - the script will prompt user for password
 
 ### Example Configuration File
 
@@ -100,6 +117,17 @@ Any other attributes that may be defined are simply ignored.
 - 💡 `|& tee output.log` is not required for the script to run - but is a good best practice to capture output from script for later analysis
     - `|&` will pipe both `stderr` and `stdin`
     - `tee output.log` will preserve script output in  your terminal as well as redirect it to a file named `output.log`
+
+### Authentication
+
+The `skopeo login` command is used to authenticate against the source and target container registries.  Upon each invocation of the script, it will **always**
+perform a `login` if a `username` is provided in the config file for a given container registry.  The authentication file `skopeo` uses is a transient file that is created during script execution in the root of the project repo.  The file name is the name of the provided `-c` argument appended with a `.auth` suffix.  Upon script exit - this file is deleted.
+
+The script supports 2 environment variables:
+- `SOURCE_CONTAINER_REGISTRY_PASSWORD`
+- `TARGET_CONTAINER_REGISTRY_PASSWORD`
+
+If authenticated access is required for a given container registry - the password will attempted to be retrieved from the respective environment variable.  If the environment variable is unset - the script will prompt the user for the password.
 
 ## Technical Details
 
